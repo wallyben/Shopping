@@ -1,88 +1,43 @@
 #!/usr/bin/env python3
 """
-Pokemon Center UK Restock Monitor
-Entry point.
+Pokemon Center UK Restock Monitor — GUI entry point.
 
-Usage:
-    python main.py [--log-level DEBUG|INFO|WARNING]
-
-Ctrl+C to stop.
+Double-click this file (or the compiled .exe) to launch the desktop app.
+No terminal interaction required.
 """
 
 from __future__ import annotations
 
-import argparse
-import asyncio
 import logging
+import queue
 import sys
 from pathlib import Path
 
-
-def _setup_logging(level_name: str) -> None:
-    level = getattr(logging, level_name.upper(), logging.INFO)
-    fmt = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
-    datefmt = "%Y-%m-%d %H:%M:%S"
-    logging.basicConfig(level=level, format=fmt, datefmt=datefmt, stream=sys.stdout)
-    # Quieten noisy library loggers
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("hpack").setLevel(logging.WARNING)
-
-
-def _check_env() -> None:
-    env_file = Path(".env")
-    if not env_file.exists():
-        print(
-            "WARNING: .env file not found.\n"
-            "Copy .env.example to .env and fill in your settings.\n"
-        )
+# Ensure project root is on sys.path when running as a script or frozen exe
+ROOT = Path(__file__).parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Pokemon Center UK restock monitor"
-    )
-    parser.add_argument(
-        "--log-level",
-        default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity (default: INFO)",
-    )
-    args = parser.parse_args()
+    # --- 1. Initialise database (auto-creates schema on first run) ---
+    from app.storage.database import init_db
+    init_db()
 
-    _check_env()
-    _setup_logging(args.log_level)
+    # --- 2. Set up logging with a UI queue ---
+    ui_log_queue: queue.Queue = queue.Queue(maxsize=2000)
+    from app.utils.logging_setup import setup_logging
+    setup_logging(ui_log_queue, level=logging.INFO)
 
     logger = logging.getLogger("main")
+    logger.info("Pokemon Center UK Monitor starting")
 
-    from monitor.config import Config
-    from monitor.stock_monitor import StockMonitor
+    # --- 3. Launch GUI ---
+    from app.ui.main_window import MainWindow
+    app = MainWindow(ui_log_queue=ui_log_queue)
+    app.mainloop()
 
-    try:
-        cfg = Config.load()
-    except FileNotFoundError as exc:
-        logger.error("Configuration error: %s", exc)
-        sys.exit(1)
-
-    active = cfg.active_skus()
-    if not active:
-        logger.error(
-            "No enabled SKUs found in skus.json.\n"
-            "Edit skus.json, add your product URLs, and set \"enabled\": true."
-        )
-        sys.exit(1)
-
-    logger.info("Pokemon Center UK Restock Monitor starting")
-    logger.info("Monitoring %d product(s):", len(active))
-    for sku in active:
-        logger.info("  - %s", sku.display())
-
-    monitor = StockMonitor(cfg)
-
-    try:
-        asyncio.run(monitor.run())
-    except KeyboardInterrupt:
-        logger.info("Stopped by user.")
+    logger.info("Application closed")
 
 
 if __name__ == "__main__":

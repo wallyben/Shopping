@@ -1,22 +1,34 @@
 """
 Core monitoring loop.
 
-Design:
-- Each SKU runs its own independent async polling loop (asyncio.gather).
-- Polling interval adapts: fast when a product was recently OOS (likely to
-  restock in a burst), normal otherwise.
-- Jitter is added to every sleep to avoid thundering-herd patterns and to
-  make request timing less machine-like.
-- State machine per SKU:
-    UNKNOWN -> first poll establishes baseline
-    OUT_OF_STOCK -> polling continues at fast or normal interval
-    IN_STOCK -> alert fired once, then continues monitoring for subsequent
-                OOS->IN_STOCK transitions (catches multiple restock events)
-    BLOCKED -> back-off 5 minutes, then retry
-- Idempotency: alert fires only on OUT_OF_STOCK -> IN_STOCK transition,
-  never on IN_STOCK -> IN_STOCK (prevents duplicate alerts after restart).
-- Consecutive UNKNOWN results >5 triggers a warning notification (detector
-  may be broken by a site structure change).
+Changes from original:
+  - StockMonitor and SKUMonitor accept an optional asyncio.Queue (event_queue).
+  - Every state change pushes a structured event dict to that queue.
+  - The GUI controller reads from that queue and dispatches UI callbacks.
+  - When no event_queue is provided behaviour is identical to the original CLI mode.
+
+Event schema pushed to queue:
+  {
+    'type': 'state_change',
+    'sku_url':    str,
+    'sku_name':   str,
+    'sku_id':     str,
+    'old_state':  str,   # StockState.value
+    'new_state':  str,
+    'timestamp':  datetime,
+    'is_restock': bool,  # True only on OOS/UNKNOWN -> IN_STOCK
+  }
+  {
+    'type': 'log',
+    'level':   str,   # 'INFO' | 'WARNING' | 'ERROR'
+    'message': str,
+    'timestamp': datetime,
+  }
+  {
+    'type': 'poll_tick',   # emitted after every poll cycle
+    'sku_url': str,
+    'timestamp': datetime,
+  }
 """
 
 from __future__ import annotations
@@ -24,7 +36,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
-from typing import Dict
+from datetime import datetime
+from typing import Optional
 
 from .config import Config, SKU
 from .detector import StockState, detect
@@ -34,18 +47,26 @@ from .notifier import Notifier
 
 logger = logging.getLogger(__name__)
 
-_BLOCKED_BACKOFF = 300.0        # 5 minutes when Cloudflare blocks
-_UNKNOWN_WARN_THRESHOLD = 5     # consecutive UNKNOWNs before warning
+_BLOCKED_BACKOFF = 300.0
+_UNKNOWN_WARN_THRESHOLD = 5
 
 
 class SKUMonitor:
     """Monitors a single SKU."""
 
-    def __init__(self, sku: SKU, cfg: Config, fetcher: Fetcher, notifier: Notifier):
+    def __init__(
+        self,
+        sku: SKU,
+        cfg: Config,
+        fetcher: Fetcher,
+        notifier: Notifier,
+        event_queue: Optional[asyncio.Queue] = None,
+    ):
         self.sku = sku
         self.cfg = cfg
         self.fetcher = fetcher
         self.notifier = notifier
+        self._event_queue = event_queue
 
         self._state: StockState = StockState.UNKNOWN
         self._consecutive_unknown = 0
@@ -66,10 +87,16 @@ class SKUMonitor:
             html = resp.text
         except Exception as exc:
             logger.error("[%s] Fetch error: %s", self.sku.sku, exc)
+            await self._push_log("ERROR", f"[{self.sku.sku}] Fetch error: {exc}")
             return
 
         new_state = detect(html, self.sku.url)
         await self._handle_state_change(new_state)
+        await self._push_event({
+            'type': 'poll_tick',
+            'sku_url': self.sku.url,
+            'timestamp': datetime.now(),
+        })
 
     async def _handle_state_change(self, new_state: StockState) -> None:
         previous = self._state
@@ -80,27 +107,32 @@ class SKUMonitor:
                 msg = (
                     f"WARNING: {self.sku.display()} has returned UNKNOWN state "
                     f"{self._consecutive_unknown} times in a row. "
-                    f"The site structure may have changed. Check detector.py."
+                    f"Site structure may have changed."
                 )
                 logger.warning(msg)
                 await self.notifier.send_status_update(msg)
-                self._consecutive_unknown = 0  # Reset to avoid spam
+                await self._push_log("WARNING", msg)
+                self._consecutive_unknown = 0
             self._state = new_state
+            await self._push_state_event(previous, new_state, is_restock=False)
             return
 
         self._consecutive_unknown = 0
 
         if new_state == StockState.BLOCKED:
             logger.warning("[%s] Blocked — backing off %ds", self.sku.sku, _BLOCKED_BACKOFF)
+            await self._push_log("WARNING", f"[{self.sku.sku}] Cloudflare blocked — backing off 5min")
             self._state = new_state
+            await self._push_state_event(previous, new_state, is_restock=False)
             await asyncio.sleep(_BLOCKED_BACKOFF)
             return
 
-        # Log every state observation at debug level
         logger.debug("[%s] state=%s (was=%s)", self.sku.sku, new_state.value, previous.value)
 
-        # Only alert on genuine OOS -> IN_STOCK transition
-        if new_state == StockState.IN_STOCK and previous != StockState.IN_STOCK:
+        is_restock = new_state == StockState.IN_STOCK and previous != StockState.IN_STOCK
+        await self._push_state_event(previous, new_state, is_restock=is_restock)
+
+        if is_restock:
             await self._fire_restock_alert(previous)
 
         self._state = new_state
@@ -108,67 +140,77 @@ class SKUMonitor:
     async def _fire_restock_alert(self, previous_state: StockState) -> None:
         logger.info("[%s] RESTOCK DETECTED (was %s)", self.sku.sku, previous_state.value)
 
-        # Terminal alert — immediate, no network required
         print_terminal_alert(self.sku)
 
-        # Browser launch — immediate
         if self.cfg.auto_open_browser:
             launch(self.sku)
 
-        # Network notifications — concurrent, non-blocking
         try:
             await self.notifier.send_restock_alert(self.sku, previous_state.value)
         except Exception as exc:
             logger.error("[%s] Notification failed: %s", self.sku.sku, exc)
+            await self._push_log("ERROR", f"[{self.sku.sku}] Notification failed: {exc}")
 
     def _next_delay(self) -> float:
-        """
-        Adaptive interval with jitter.
-
-        Fast interval: product was OOS or unknown (restock could happen soon).
-        Normal interval: product is in stock (monitoring for future OOS events).
-        Blocked: handled inside _handle_state_change with its own sleep.
-        """
         if self._state in (StockState.OUT_OF_STOCK, StockState.UNKNOWN):
             base = self.cfg.poll_interval_fast
         else:
             base = self.cfg.poll_interval
+        return base + random.uniform(0, self.cfg.poll_jitter_max)
 
-        jitter = random.uniform(0, self.cfg.poll_jitter_max)
-        return base + jitter
+    async def _push_state_event(
+        self, old: StockState, new: StockState, is_restock: bool
+    ) -> None:
+        await self._push_event({
+            'type': 'state_change',
+            'sku_url':    self.sku.url,
+            'sku_name':   self.sku.name,
+            'sku_id':     self.sku.sku,
+            'old_state':  old.value,
+            'new_state':  new.value,
+            'timestamp':  datetime.now(),
+            'is_restock': is_restock,
+        })
+
+    async def _push_log(self, level: str, message: str) -> None:
+        await self._push_event({
+            'type':      'log',
+            'level':     level,
+            'message':   message,
+            'timestamp': datetime.now(),
+        })
+
+    async def _push_event(self, event: dict) -> None:
+        if self._event_queue is not None:
+            await self._event_queue.put(event)
 
 
 class StockMonitor:
     """Manages multiple SKUMonitors and shared resources."""
 
-    def __init__(self, cfg: Config):
+    def __init__(self, cfg: Config, event_queue: Optional[asyncio.Queue] = None):
         self.cfg = cfg
-        self._fetcher: Fetcher | None = None
-        self._notifier: Notifier | None = None
+        self._event_queue = event_queue
 
     async def run(self) -> None:
         active = self.cfg.active_skus()
         if not active:
-            logger.error("No enabled SKUs in skus.json. Add products and set enabled=true.")
+            logger.error("No enabled SKUs. Add products and enable them.")
             return
 
         if not self.cfg.has_notifier:
-            logger.warning(
-                "No notification channels configured. "
-                "Alerts will only appear in the terminal. "
-                "Set DISCORD_WEBHOOK_URL or TELEGRAM_* in .env"
-            )
+            logger.warning("No notification channels configured.")
 
         async with Fetcher(proxy=self.cfg.http_proxy) as fetcher:
             notifier = Notifier(self.cfg)
             try:
                 monitors = [
-                    SKUMonitor(sku, self.cfg, fetcher, notifier)
+                    SKUMonitor(sku, self.cfg, fetcher, notifier, self._event_queue)
                     for sku in active
                 ]
 
                 logger.info(
-                    "Monitoring %d SKU(s). Fast interval: %.0fs, Normal interval: %.0fs, Jitter: 0–%.0fs",
+                    "Monitoring %d SKU(s). Fast: %.0fs  Normal: %.0fs  Jitter: 0–%.0fs",
                     len(monitors),
                     self.cfg.poll_interval_fast,
                     self.cfg.poll_interval,
