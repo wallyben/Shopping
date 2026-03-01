@@ -54,10 +54,23 @@ def launch(sku: SKU) -> None:
 
 def print_terminal_alert(sku: SKU) -> None:
     border = "=" * 70
-    print(f"\n{border}")
-    print(f"  *** RESTOCK DETECTED ***")
-    print(f"  Product : {sku.name}")
-    print(f"  SKU     : {sku.sku}")
-    print(f"  URL     : {sku.url}")
-    print(f"{border}\n")
-    sys.stdout.flush()
+    lines = [
+        border,
+        "  *** RESTOCK DETECTED ***",
+        f"  Product : {sku.name}",
+        f"  SKU     : {sku.sku}",
+        f"  URL     : {sku.url}",
+        border,
+    ]
+    # Logger routes to the rolling file and the GUI log panel in both modes.
+    logger.info("\n".join(lines))
+    # Print is a no-op in --windowed PyInstaller builds (stdout is closed).
+    # Wrapped in try/except so it never raises in GUI mode.
+    try:
+        print()
+        for line in lines:
+            print(line)
+        print()
+        sys.stdout.flush()
+    except Exception:
+        pass

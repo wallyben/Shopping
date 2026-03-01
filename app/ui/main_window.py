@@ -19,8 +19,11 @@ First-run detection:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import queue
+import sys
+import threading
 import tkinter as tk
 from datetime import datetime
 from tkinter import messagebox
@@ -235,8 +238,70 @@ class MainWindow(ctk.CTk):
         self.wait_window(dlg)
 
     def _test_notification(self) -> None:
-        dlg = SettingsDialog(self)
-        self.wait_window(dlg)
+        """
+        Send a test notification through all currently configured channels.
+        Reads saved secrets directly from keyring — does not open Settings.
+        Runs the async send in a daemon thread so the UI stays responsive.
+        """
+        from app.services import keyring_service as ks
+
+        discord  = ks.get_discord_webhook()
+        tg_token = ks.get_telegram_token()
+        tg_chat  = ks.get_telegram_chat_id()
+
+        if not discord and not (tg_token and tg_chat):
+            messagebox.showwarning(
+                "No Channels Configured",
+                "Open Settings and configure at least one notification\n"
+                "channel (Discord or Telegram) before testing.",
+                parent=self,
+            )
+            return
+
+        def _run() -> None:
+            async def _send() -> list[str]:
+                import httpx
+                errors: list[str] = []
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    if discord:
+                        try:
+                            r = await client.post(
+                                discord,
+                                json={"content": "Pokemon Center Monitor — test notification ✓"},
+                            )
+                            if r.status_code not in (200, 204):
+                                errors.append(f"Discord: HTTP {r.status_code}")
+                        except Exception as exc:
+                            errors.append(f"Discord: {exc}")
+
+                    if tg_token and tg_chat:
+                        try:
+                            r = await client.post(
+                                f"https://api.telegram.org/bot{tg_token}/sendMessage",
+                                json={
+                                    "chat_id": tg_chat,
+                                    "text": "Pokemon Center Monitor — test notification ✓",
+                                },
+                            )
+                            data = r.json()
+                            if not data.get("ok"):
+                                errors.append(f"Telegram: {data.get('description', data)}")
+                        except Exception as exc:
+                            errors.append(f"Telegram: {exc}")
+                return errors
+
+            errors = asyncio.run(_send())
+            if errors:
+                self.after(0, lambda: messagebox.showerror(
+                    "Test Failed", "\n".join(errors), parent=self
+                ))
+            else:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Test Sent", "Test notification sent successfully.", parent=self
+                ))
+
+        threading.Thread(target=_run, daemon=True, name="test-notify").start()
+        logger.info("Sending test notification")
 
     def _on_toggle_enabled(self, product_id: int, new_state: bool) -> None:
         db.set_product_enabled(product_id, new_state)
@@ -259,9 +324,68 @@ class MainWindow(ctk.CTk):
 
         if is_restock:
             self._table.flash_restock(sku_url)
-            # Schedule un-flash after 3 seconds
             self.after(3000, lambda u=sku_url, s=new_state, c=checked_str:
                        self._table.update_status(u, s, c))
+            # Look up name for the alert message
+            products = db.get_all_products()
+            name = next((p.name for p in products if p.url == sku_url), sku_url)
+            self._on_restock(name, sku_url)
+
+    def _on_restock(self, name: str, url: str) -> None:
+        """
+        Called on OOS→IN_STOCK transition. Surfaces the window and fires an
+        OS-level toast so the alert is visible even when the app is minimised.
+        """
+        logger.info("RESTOCK: %s — %s", name, url)
+
+        # 1. Bring window to front regardless of platform
+        self.deiconify()
+        self.lift()
+        self.focus_force()
+
+        # 2. Flash the window title for 8 seconds (4 × 2s blinks)
+        self._flash_title(f"RESTOCK DETECTED — {name}", cycles=4)
+
+        # 3. Audio alert — stdlib only, Windows-only (silent fallback on others)
+        if sys.platform == "win32":
+            try:
+                import winsound
+                # MB_ICONHAND = critical/error sound (loud and distinct)
+                winsound.MessageBeep(winsound.MB_ICONHAND)
+            except Exception:
+                pass
+
+        # 4. OS toast notification (plyer — graceful fallback if unavailable)
+        def _toast() -> None:
+            try:
+                from plyer import notification as plyer_notify
+                plyer_notify.notify(
+                    title="RESTOCK DETECTED",
+                    message=f"{name}\n{url}",
+                    app_name="Pokemon Center Monitor",
+                    timeout=12,
+                )
+            except Exception:
+                pass  # plyer not installed or no notification backend
+
+        threading.Thread(target=_toast, daemon=True, name="restock-toast").start()
+
+    def _flash_title(self, alert_title: str, cycles: int = 4) -> None:
+        """
+        Alternate window title between alert text and the default title.
+        Each cycle is 1 second (500ms on, 500ms off).
+        """
+        default_title = "Pokemon Center UK Monitor"
+        total_steps = cycles * 2  # on + off per cycle
+
+        def _step(remaining: int, show_alert: bool) -> None:
+            if remaining <= 0:
+                self.title(default_title)
+                return
+            self.title(alert_title if show_alert else default_title)
+            self.after(500, lambda: _step(remaining - 1, not show_alert))
+
+        _step(total_steps, show_alert=True)
 
     def _on_poll_tick(self, sku_url: str, ts: datetime) -> None:
         self._last_poll_ts = ts

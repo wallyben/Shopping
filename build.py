@@ -55,6 +55,9 @@ def run_pyinstaller() -> None:
         # Bundle customtkinter's data files (themes, images)
         "--collect-all", "customtkinter",
 
+        # plyer notification backends
+        "--collect-all", "plyer",
+
         # Hidden imports: keyring platform backends
         "--hidden-import", "keyring.backends.Windows",
         "--hidden-import", "keyring.backends.macOS",

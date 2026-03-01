@@ -8,6 +8,10 @@ aiofiles==23.2.1
 # GUI
 customtkinter==5.2.2
 
+# OS-level toast notifications on restock (Windows/macOS/Linux)
+# Optional — app degrades gracefully if not installed
+plyer==2.1.0
+
 # Secret storage (OS keyring)
 keyring==25.2.1
 
