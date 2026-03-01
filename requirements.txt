@@ -1,0 +1,19 @@
+# Core monitor engine
+httpx[http2]==0.27.0
+beautifulsoup4==4.12.3
+lxml==5.2.2
+python-dotenv==1.0.1
+aiofiles==23.2.1
+
+# GUI
+customtkinter==5.2.2
+
+# OS-level toast notifications on restock (Windows/macOS/Linux)
+# Optional — app degrades gracefully if not installed
+plyer==2.1.0
+
+# Secret storage (OS keyring)
+keyring==25.2.1
+
+# Build tooling (not needed at runtime, only for packaging)
+pyinstaller==6.7.0
