@@ -21,7 +21,9 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-# Headers that match Chrome 124 on Windows 10.
+_WARMUP_URL = "https://www.pokemoncenter.com/en-gb"
+
+# Headers that match a realistic Chrome browser on Windows 10.
 # Keeping Accept-Language as en-GB signals locale correctly for the en-gb subdomain.
 _BASE_HEADERS = {
     "User-Agent": (
@@ -31,18 +33,11 @@ _BASE_HEADERS = {
     ),
     "Accept": (
         "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,image/apng,*/*;q=0.8"
+        "image/avif,image/webp,*/*;q=0.8"
     ),
     "Accept-Language": "en-GB,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
+    "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
-    "DNT": "1",
 }
 
 _MAX_RETRIES = 3
@@ -60,6 +55,17 @@ class Fetcher:
             transport=transport,
             proxies={"all://": proxy} if proxy else None,
         )
+        self._warmed_up = False
+
+    async def _warmup(self) -> None:
+        """Perform a single GET to the homepage to establish cookies for the session."""
+        try:
+            resp = await self._client.get(_WARMUP_URL)
+            logger.debug("Warmup GET %s → %d", _WARMUP_URL, resp.status_code)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Warmup request failed (%s) — continuing anyway", exc)
+        finally:
+            self._warmed_up = True
 
     async def get(self, url: str) -> httpx.Response:
         """
@@ -67,6 +73,9 @@ class Fetcher:
         Retries on: connection errors, timeouts, 429, 5xx.
         Raises on: 403 (likely blocked), 404, other 4xx.
         """
+        if not self._warmed_up:
+            await self._warmup()
+
         last_exc: Optional[Exception] = None
 
         for attempt in range(_MAX_RETRIES):
