@@ -16,9 +16,13 @@ import logging
 import logging.handlers
 import queue
 import re
+import sys
 from pathlib import Path
 
-APP_DIR = Path(__file__).parent.parent.parent
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).parent
+else:
+    APP_DIR = Path(__file__).resolve().parents[2]
 LOG_DIR = APP_DIR / "logs"
 LOG_FILE = LOG_DIR / "monitor.log"
 
