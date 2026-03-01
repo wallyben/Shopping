@@ -74,6 +74,14 @@ class Fetcher:
                 resp = await self._client.get(url)
 
                 if resp.status_code == 200:
+                    # --- DIAGNOSTIC ---
+                    _body = resp.text
+                    _jsonld_present = 'application/ld+json' in _body
+                    logger.info(
+                        "[DIAG] %s | status=%d | json-ld=%s | body[:800]=%r",
+                        url, resp.status_code, _jsonld_present, _body[:800],
+                    )
+                    # --- END DIAGNOSTIC ---
                     return resp
 
                 if resp.status_code == 429:
