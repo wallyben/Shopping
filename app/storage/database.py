@@ -13,13 +13,16 @@ directly — it reads config once at start and the UI thread owns all DB writes.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-# Placed next to main.py so the portable .exe bundle keeps data in one place
-APP_DIR = Path(__file__).parent.parent.parent
+if getattr(sys, "frozen", False):
+    APP_DIR = Path(sys.executable).parent
+else:
+    APP_DIR = Path(__file__).resolve().parents[2]
 DB_PATH = APP_DIR / "monitor_data.db"
 
 

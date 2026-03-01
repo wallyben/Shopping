@@ -193,9 +193,17 @@ class SettingsDialog(ctk.CTkToplevel):
 
             errors = asyncio.run(_send())
             if errors:
-                self.after(0, lambda: messagebox.showerror("Test Failed", "\n".join(errors), parent=self))
+                try:
+                    if self.winfo_exists():
+                        self.after(0, lambda: messagebox.showerror("Test Failed", "\n".join(errors), parent=self))
+                except Exception:
+                    pass
             else:
-                self.after(0, lambda: messagebox.showinfo("Test Sent", "Test notification sent successfully.", parent=self))
+                try:
+                    if self.winfo_exists():
+                        self.after(0, lambda: messagebox.showinfo("Test Sent", "Test notification sent successfully.", parent=self))
+                except Exception:
+                    pass
 
         threading.Thread(target=_run, daemon=True).start()
 
