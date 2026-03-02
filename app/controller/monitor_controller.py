@@ -98,6 +98,8 @@ class MonitorController:
         self._cat_fetcher: Optional[Fetcher] = None
         self._cat_notifier: Optional[Notifier] = None
         self._cat_config: Optional[Config] = None
+        self._stock_monitor: Optional[StockMonitor] = None
+        self._category_signal_tasks: set[asyncio.Task] = set()
 
     @property
     def is_running(self) -> bool:
@@ -162,6 +164,7 @@ class MonitorController:
         self._cat_config = config
 
         monitor = StockMonitor(config, event_queue=self._event_queue)
+        self._stock_monitor = monitor
 
         # Separate Fetcher + Notifier for category polling and one-shot
         # product confirmation.  StockMonitor owns its own Fetcher internally.
@@ -186,10 +189,20 @@ class MonitorController:
                 await asyncio.gather(
                     monitor_task, cat_task, reader_task, return_exceptions=True
                 )
+
+                pending_category_tasks = [
+                    task for task in self._category_signal_tasks if not task.done()
+                ]
+                for task in pending_category_tasks:
+                    task.cancel()
+                if pending_category_tasks:
+                    await asyncio.gather(*pending_category_tasks, return_exceptions=True)
             finally:
                 await self._cat_notifier.close()
+                self._category_signal_tasks.clear()
                 self._cat_fetcher = None
                 self._cat_notifier = None
+                self._stock_monitor = None
 
     async def _event_reader(self) -> None:
         """
@@ -206,7 +219,9 @@ class MonitorController:
 
             if event.get("type") == "category_signal":
                 # Handle entirely on the monitor thread — needs async fetch
-                asyncio.create_task(self._handle_category_signal(event))
+                task = asyncio.create_task(self._handle_category_signal(event))
+                self._category_signal_tasks.add(task)
+                task.add_done_callback(self._category_signal_tasks.discard)
                 continue
 
             # Capture event in closure to avoid late-binding bug
@@ -252,6 +267,8 @@ class MonitorController:
         """
         if self._cat_fetcher is None or self._cat_notifier is None or self._cat_config is None:
             return
+        if self._stop_event is not None and self._stop_event.is_set():
+            return
 
         sku_id   = event["sku"]
         sku_url  = event["url"]
@@ -280,6 +297,12 @@ class MonitorController:
                 confirmed_state.value,
             )
         except Exception as exc:
+            if self._stop_event is not None and self._stop_event.is_set():
+                logger.debug(
+                    "[CategorySignal] Ignoring confirmation fetch error during shutdown for %s",
+                    sku_id,
+                )
+                return
             logger.warning(
                 "[CategorySignal] Confirmation fetch failed for %s: %s — treating as UNKNOWN",
                 sku_id,
@@ -304,6 +327,12 @@ class MonitorController:
                 sku_id,
             )
             return
+
+        if self._stop_event is not None and self._stop_event.is_set():
+            return
+
+        if self._stock_monitor is not None:
+            self._stock_monitor.mark_in_stock_from_category_signal(sku_id)
 
         # ── Fire restock alert ─────────────────────────────────────────────
         logger.info(
