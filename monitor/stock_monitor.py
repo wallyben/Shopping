@@ -151,6 +151,14 @@ class SKUMonitor:
             logger.error("[%s] Notification failed: %s", self.sku.sku, exc)
             await self._push_log("ERROR", f"[{self.sku.sku}] Notification failed: {exc}")
 
+    def mark_in_stock_from_category_signal(self) -> None:
+        """
+        Keep SKU monitor state in sync when category-path alerts are fired.
+        This prevents the next SKU poll from emitting a duplicate restock alert.
+        """
+        self._state = StockState.IN_STOCK
+        self._consecutive_unknown = 0
+
     def _next_delay(self) -> float:
         if self._state in (StockState.OUT_OF_STOCK, StockState.UNKNOWN):
             base = self.cfg.poll_interval_fast
@@ -191,6 +199,12 @@ class StockMonitor:
     def __init__(self, cfg: Config, event_queue: Optional[asyncio.Queue] = None):
         self.cfg = cfg
         self._event_queue = event_queue
+        self._monitors_by_sku: dict[str, SKUMonitor] = {}
+
+    def mark_in_stock_from_category_signal(self, sku_id: str) -> None:
+        monitor = self._monitors_by_sku.get(sku_id)
+        if monitor is not None:
+            monitor.mark_in_stock_from_category_signal()
 
     async def run(self) -> None:
         active = self.cfg.active_skus()
@@ -208,6 +222,7 @@ class StockMonitor:
                     SKUMonitor(sku, self.cfg, fetcher, notifier, self._event_queue)
                     for sku in active
                 ]
+                self._monitors_by_sku = {m.sku.sku: m for m in monitors}
 
                 logger.info(
                     "Monitoring %d SKU(s). Fast: %.0fs  Normal: %.0fs  Jitter: 0–%.0fs",
@@ -219,4 +234,5 @@ class StockMonitor:
 
                 await asyncio.gather(*(m.run() for m in monitors))
             finally:
+                self._monitors_by_sku = {}
                 await notifier.close()
