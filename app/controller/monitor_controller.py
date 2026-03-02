@@ -26,7 +26,12 @@ import threading
 from datetime import datetime
 from typing import Callable, Optional
 
+from monitor.category_monitor import CategoryMonitor
 from monitor.config import Config, SKU as MonitorSKU
+from monitor.detector import StockState, detect
+from monitor.fetcher import Fetcher
+from monitor.launcher import launch, print_terminal_alert
+from monitor.notifier import Notifier
 from monitor.stock_monitor import StockMonitor
 from app.storage import database as db
 from app.services import keyring_service as ks
@@ -89,6 +94,11 @@ class MonitorController:
         self._event_queue: Optional[asyncio.Queue] = None
         self._running = False
 
+        # Category-signal confirmation resources (set in _async_main)
+        self._cat_fetcher: Optional[Fetcher] = None
+        self._cat_notifier: Optional[Notifier] = None
+        self._cat_config: Optional[Config] = None
+
     @property
     def is_running(self) -> bool:
         return self._running
@@ -149,18 +159,37 @@ class MonitorController:
     async def _async_main(self, config: Config) -> None:
         self._stop_event = asyncio.Event()
         self._event_queue = asyncio.Queue()
+        self._cat_config = config
 
         monitor = StockMonitor(config, event_queue=self._event_queue)
 
-        monitor_task = asyncio.create_task(monitor.run())
-        reader_task = asyncio.create_task(self._event_reader())
+        # Separate Fetcher + Notifier for category polling and one-shot
+        # product confirmation.  StockMonitor owns its own Fetcher internally.
+        async with Fetcher(proxy=config.http_proxy) as cat_fetcher:
+            self._cat_fetcher = cat_fetcher
+            self._cat_notifier = Notifier(config)
+            try:
+                cat_monitor = CategoryMonitor(
+                    config.active_skus(), config, cat_fetcher, self._event_queue
+                )
 
-        await self._stop_event.wait()
+                monitor_task = asyncio.create_task(monitor.run())
+                cat_task = asyncio.create_task(cat_monitor.run())
+                reader_task = asyncio.create_task(self._event_reader())
 
-        monitor_task.cancel()
-        reader_task.cancel()
+                await self._stop_event.wait()
 
-        await asyncio.gather(monitor_task, reader_task, return_exceptions=True)
+                monitor_task.cancel()
+                cat_task.cancel()
+                reader_task.cancel()
+
+                await asyncio.gather(
+                    monitor_task, cat_task, reader_task, return_exceptions=True
+                )
+            finally:
+                await self._cat_notifier.close()
+                self._cat_fetcher = None
+                self._cat_notifier = None
 
     async def _event_reader(self) -> None:
         """
@@ -173,6 +202,11 @@ class MonitorController:
                     self._event_queue.get(), timeout=0.2
                 )
             except asyncio.TimeoutError:
+                continue
+
+            if event.get("type") == "category_signal":
+                # Handle entirely on the monitor thread — needs async fetch
+                asyncio.create_task(self._handle_category_signal(event))
                 continue
 
             # Capture event in closure to avoid late-binding bug
@@ -199,3 +233,106 @@ class MonitorController:
 
         elif etype == "poll_tick":
             self._on_poll_tick(event["sku_url"], event["timestamp"])
+
+    # ------------------------------------------------------------------
+    # Category-signal confirmation — runs on the monitor thread (async)
+    # ------------------------------------------------------------------
+
+    async def _handle_category_signal(self, event: dict) -> None:
+        """
+        One-shot product-page confirmation triggered by a category_signal.
+
+        Steps
+        -----
+        1. Fetch the single product page once via the category Fetcher.
+        2. Run the existing detector on the returned HTML.
+        3. IN_STOCK          → trigger restock alert + emit state_change.
+        4. UNKNOWN / BLOCKED → fail-open (category signal is strong) — same.
+        5. OUT_OF_STOCK      → false alarm, log and return without alerting.
+        """
+        if self._cat_fetcher is None or self._cat_notifier is None or self._cat_config is None:
+            return
+
+        sku_id   = event["sku"]
+        sku_url  = event["url"]
+        sku_name = event["name"]
+
+        sku_obj = next(
+            (s for s in self._cat_config.active_skus() if s.sku == sku_id),
+            None,
+        )
+        if sku_obj is None:
+            logger.warning("[CategorySignal] SKU %s not in active config — skipping", sku_id)
+            return
+
+        logger.info(
+            "[CategorySignal] Confirming %s (%s) via product page", sku_name, sku_id
+        )
+
+        # ── Single product-page fetch ──────────────────────────────────────
+        confirmed_state = StockState.UNKNOWN
+        try:
+            resp = await self._cat_fetcher.get(sku_url)
+            confirmed_state = detect(resp.text, sku_url)
+            logger.info(
+                "[CategorySignal] Product page result for %s: %s",
+                sku_id,
+                confirmed_state.value,
+            )
+        except Exception as exc:
+            logger.warning(
+                "[CategorySignal] Confirmation fetch failed for %s: %s — treating as UNKNOWN",
+                sku_id,
+                exc,
+            )
+            confirmed_state = StockState.UNKNOWN
+
+        # ── Decision ──────────────────────────────────────────────────────
+        if confirmed_state == StockState.IN_STOCK:
+            reason = "product page confirmed IN_STOCK"
+        elif confirmed_state in (StockState.UNKNOWN, StockState.BLOCKED):
+            # Fail-open: category signal is strong, product page inconclusive
+            reason = (
+                f"fail-open — product page returned {confirmed_state.value}, "
+                "category signal strong"
+            )
+        else:
+            # OUT_OF_STOCK — category signal was a false positive
+            logger.info(
+                "[CategorySignal] %s (%s) still OOS on product page — no alert",
+                sku_name,
+                sku_id,
+            )
+            return
+
+        # ── Fire restock alert ─────────────────────────────────────────────
+        logger.info(
+            "[CategorySignal] RESTOCK: %s (%s) — %s", sku_name, sku_id, reason
+        )
+
+        print_terminal_alert(sku_obj)
+
+        if self._cat_config.auto_open_browser:
+            launch(sku_obj)
+
+        try:
+            await self._cat_notifier.send_restock_alert(
+                sku_obj, StockState.OUT_OF_STOCK.value
+            )
+        except Exception as exc:
+            logger.error(
+                "[CategorySignal] Notification failed for %s: %s", sku_id, exc
+            )
+
+        # Emit state_change so _dispatch handles DB update + UI callback
+        if self._event_queue is not None:
+            await self._event_queue.put({
+                "type":      "state_change",
+                "sku_url":   sku_url,
+                "sku_name":  sku_name,
+                "sku_id":    sku_id,
+                "old_state": StockState.OUT_OF_STOCK.value,
+                "new_state": StockState.IN_STOCK.value,
+                "timestamp": datetime.now(),
+                "is_restock": True,
+            })
