@@ -1,47 +1,6 @@
 """
 Category-page monitor for Pokemon Center UK.
-
-Polls category pages on a ~30 s cadence to detect SKU availability changes
-before committing a per-product confirmation fetch.
-
-Flow
-----
-1. Every poll_interval (+jitter) both CATEGORY_URLS are fetched.
-2. Product tiles are parsed; SKU, name, and availability are extracted.
-3. For each monitored SKU we track in-memory last-known availability.
-4. When a SKU transitions from OUT_OF_STOCK to anything else we emit a
-   'category_signal' event to the shared asyncio.Queue.
-
-Event pushed to queue
----------------------
-{
-    'type':      'category_signal',
-    'sku':       str,        # SKU ID matching monitor.config.SKU.sku
-    'name':      str,        # Product name from tile (may be empty string)
-    'url':       str,        # Full product URL from config
-    'timestamp': datetime,
-}
-
-The MonitorController handles 'category_signal' by doing a single
-product-page confirmation fetch and, if confirmed (or if the page is
-blocked), triggers the existing restock notification flow.
-
-Parsing strategy
-----------------
-Category page tiles are found by three fallback strategies:
-  1. Elements whose class name matches product-tile / product-card patterns.
-  2. Any element carrying a known SKU data attribute.
-  3. Anchor tags whose href contains /product/<sku>.
-
-For each tile the SKU is extracted (data attribute → ancestor attribute →
-href pattern), then name and availability are determined from button state
-and text patterns — mirroring the logic in detector.py.
-
-State management
-----------------
-In-memory only.  No DB reads/writes.  The dict is pre-seeded as empty so
-only *changes* (not initial state) fire signals, eliminating false positives
-on startup.
+UPDATED with anti-detection measures: longer intervals, random jitter, and human-like patterns.
 """
 
 from __future__ import annotations
@@ -61,66 +20,24 @@ from .fetcher import Fetcher
 logger = logging.getLogger(__name__)
 
 # ── Category URLs to poll ─────────────────────────────────────────────────────
-
 CATEGORY_URLS: list[str] = [
     "https://www.pokemoncenter.com/en-gb/category/trading-card-game",
     "https://www.pokemoncenter.com/en-gb/category/new-releases",
 ]
 
-# ── HTML parsing constants ─────────────────────────────────────────────────────
-
-# Class-name patterns that identify product tile containers
-_TILE_CLASS_RE = re.compile(
-    r"product[_-]?(?:tile|card|grid)|grid[_-]?tile", re.I
-)
-
-# data-* attributes that may carry the SKU / product ID on a tile element
-_SKU_ATTRS = (
-    "data-sku",
-    "data-product-id",
-    "data-pid",
-    "data-item-id",
-    "data-variant-id",
-)
-
-# Regex to extract SKU from a product URL path: /en-gb/product/<sku>
+# ── HTML parsing constants (unchanged) ────────────────────────────────────────
+_TILE_CLASS_RE = re.compile(r"product[_-]?(?:tile|card|grid)|grid[_-]?tile", re.I)
+_SKU_ATTRS = ("data-sku", "data-product-id", "data-pid", "data-item-id", "data-variant-id")
 _URL_SKU_RE = re.compile(r"/product/([^/?#]+)")
-
-# Class-name patterns for product name elements within a tile
-_NAME_CLASS_RE = re.compile(
-    r"product[_-]?(?:name|title)|tile[_-]?(?:name|title)", re.I
-)
-
-# Text patterns that indicate an enabled add-to-cart control (in-stock)
+_NAME_CLASS_RE = re.compile(r"product[_-]?(?:name|title)|tile[_-]?(?:name|title)", re.I)
 _IN_STOCK_TEXT = ("add to cart", "add to bag")
-
-# Text patterns that indicate the tile is out of stock
-_OOS_TEXT = (
-    "out of stock",
-    "sold out",
-    "notify me",
-    "email me when available",
-    "currently unavailable",
-)
+_OOS_TEXT = ("out of stock", "sold out", "notify me", "email me when available", "currently unavailable")
 
 
 class CategoryMonitor:
     """
-    Polls CATEGORY_URLS and emits 'category_signal' events when a monitored
-    SKU appears to transition from OUT_OF_STOCK to a potentially in-stock
-    state.
-
-    Parameters
-    ----------
-    target_skus : list[SKU]
-        The active SKUs to watch (from Config.active_skus()).
-    cfg : Config
-        Monitor configuration (used for poll_interval and poll_jitter_max).
-    fetcher : Fetcher
-        Shared HTTP client — the same Fetcher instance used elsewhere so we
-        don't open a second connection pool.
-    event_queue : asyncio.Queue
-        Shared event queue consumed by MonitorController._event_reader.
+    Polls CATEGORY_URLS and emits 'category_signal' events.
+    UPDATED: Now includes human-like delays and random jitter to avoid detection.
     """
 
     def __init__(
@@ -130,63 +47,103 @@ class CategoryMonitor:
         fetcher: Fetcher,
         event_queue: asyncio.Queue,
     ) -> None:
-        # Index targets by sku string for O(1) membership checks
         self._targets: dict[str, SKU] = {s.sku: s for s in target_skus}
         self._cfg = cfg
         self._fetcher = fetcher
         self._event_queue = event_queue
-
-        # In-memory availability state: sku_id -> "IN_STOCK"|"OUT_OF_STOCK"|"UNKNOWN"
-        # Starts empty — only changes (not initial state) fire signals.
         self._state: dict[str, str] = {}
+        
+        # Track request timing to avoid patterns
+        self._last_request_time = 0
+        self._request_count = 0
 
-    # ── Public interface ───────────────────────────────────────────────────────
+    async def _human_delay(self, min_seconds: float = 1, max_seconds: float = 3):
+        """Add random delay with variable pattern to mimic human behavior."""
+        # Base delay
+        delay = random.uniform(min_seconds, max_seconds)
+        
+        # Occasionally add longer "thinking" delays
+        if random.random() < 0.3:  # 30% chance
+            delay += random.uniform(2, 5)
+            
+        await asyncio.sleep(delay)
+
+    async def _respect_rate_limit(self):
+        """Ensure we don't request too quickly."""
+        now = datetime.now().timestamp()
+        time_since_last = now - self._last_request_time
+        
+        # Minimum 2 seconds between requests
+        if time_since_last < 2:
+            await asyncio.sleep(2 - time_since_last)
+        
+        # Reset counter if we've been waiting a while
+        if time_since_last > 30:
+            self._request_count = 0
+        
+        self._last_request_time = datetime.now().timestamp()
+        self._request_count += 1
+        
+        # If we've made many requests, take a longer break
+        if self._request_count > 5:
+            long_break = random.uniform(10, 20)
+            logger.debug(f"Taking a {long_break:.1f}s break after {self._request_count} requests")
+            await asyncio.sleep(long_break)
+            self._request_count = 0
 
     async def run(self) -> None:
-        """Main polling loop.  Runs until the containing task is cancelled."""
+        """Main polling loop with anti-detection measures."""
         logger.info(
             "[CategoryMonitor] Starting — watching %d SKU(s) across %d category URL(s)",
             len(self._targets),
             len(CATEGORY_URLS),
         )
+        
         while True:
             for url in CATEGORY_URLS:
+                # Add human-like delay BEFORE each request
+                await self._human_delay(2, 5)
+                await self._respect_rate_limit()
                 await self._poll(url)
-            delay = self._cfg.poll_interval + random.uniform(
-                0, self._cfg.poll_jitter_max
-            )
-            logger.debug("[CategoryMonitor] Next poll in %.1fs", delay)
-            await asyncio.sleep(delay)
-
-    # ── Internals ─────────────────────────────────────────────────────────────
+            
+            # Much longer delay between full cycles (5-10 minutes)
+            cycle_delay = random.uniform(300, 600)  # 5-10 minutes
+            logger.debug("[CategoryMonitor] Next full cycle in %.1f minutes", cycle_delay/60)
+            await asyncio.sleep(cycle_delay)
 
     async def _poll(self, category_url: str) -> None:
         """Fetch one category page and process matching tiles."""
         try:
+            # Add jitter before fetch
+            await self._human_delay(1, 4)
+            
             resp = await self._fetcher.get(category_url)
+            
+            # Check if we got blocked
+            if resp.status_code in [403, 429, 503]:
+                logger.warning(f"[CategoryMonitor] Got status {resp.status_code} -可能 blocked")
+                # Take a long break if blocked
+                await asyncio.sleep(random.uniform(300, 600))
+                return
+                
         except Exception as exc:
-            logger.warning(
-                "[CategoryMonitor] Fetch error for %s: %s", category_url, exc
-            )
+            logger.warning("[CategoryMonitor] Fetch error for %s: %s", category_url, exc)
             return
 
         tiles = self._parse_tiles(resp.text, category_url)
-        logger.debug(
-            "[CategoryMonitor] %s — %d matching tile(s) found",
-            category_url,
-            len(tiles),
-        )
+        
+        if tiles:
+            logger.debug("[CategoryMonitor] %s — %d matching tile(s) found", category_url, len(tiles))
 
         for tile in tiles:
             sku_id = tile["sku"]
             availability = tile["availability"]
             prev = self._state.get(sku_id)
 
-            # Update in-memory state unconditionally
+            # Update in-memory state
             self._state[sku_id] = availability
 
-            # Fire signal only when we had a confirmed OOS baseline and now
-            # the tile no longer shows OOS
+            # Fire signal only on OOS → something else transition
             if prev == "OUT_OF_STOCK" and availability != "OUT_OF_STOCK":
                 target = self._targets[sku_id]
                 logger.info(
@@ -197,25 +154,16 @@ class CategoryMonitor:
                     availability,
                 )
                 await self._event_queue.put({
-                    "type":      "category_signal",
-                    "sku":       sku_id,
-                    "name":      tile.get("name") or target.name,
-                    "url":       target.url,
+                    "type": "category_signal",
+                    "sku": sku_id,
+                    "name": tile.get("name") or target.name,
+                    "url": target.url,
                     "timestamp": datetime.now(),
                 })
 
-    # ── HTML parsing ──────────────────────────────────────────────────────────
-
+    # ── HTML parsing methods (unchanged from your original) ───────────────────
     def _parse_tiles(self, html: str, category_url: str) -> list[dict]:
-        """
-        Extract product tile data from category-page HTML.
-
-        Returns a list of dicts — one per tile whose SKU is in self._targets:
-            {"sku": str, "name": str, "availability": str}
-
-        Three discovery strategies are tried in order, stopping at the first
-        that yields any elements.
-        """
+        """Extract product tile data from category-page HTML."""
         soup = BeautifulSoup(html, "lxml")
         candidate_elements: list = []
 
@@ -243,25 +191,15 @@ class CategoryMonitor:
             seen.add(sku_id)
 
             results.append({
-                "sku":          sku_id,
-                "name":         self._extract_name(element),
+                "sku": sku_id,
+                "name": self._extract_name(element),
                 "availability": self._extract_availability(element),
             })
-
-        if not results and self._targets:
-            logger.debug(
-                "[CategoryMonitor] No matching tiles found on %s "
-                "(page may be JS-rendered or tile structure has changed)",
-                category_url,
-            )
 
         return results
 
     def _extract_sku(self, element) -> Optional[str]:
-        """
-        Extract SKU from element data attributes, ancestor attributes,
-        or an anchor href.  Returns None if nothing is found.
-        """
+        """Extract SKU from element."""
         # Direct attributes on the element
         for attr in _SKU_ATTRS:
             val = element.get(attr)
@@ -289,7 +227,7 @@ class CategoryMonitor:
         return None
 
     def _extract_name(self, element) -> str:
-        """Return product name from a tile element, or empty string."""
+        """Return product name from a tile element."""
         name_el = element.find(class_=_NAME_CLASS_RE)
         if not name_el:
             name_el = element.find(["h2", "h3", "h4"])
@@ -298,26 +236,14 @@ class CategoryMonitor:
         return ""
 
     def _extract_availability(self, element) -> str:
-        """
-        Determine tile availability.
-
-        Checks (in order):
-          1. Enabled add-to-cart / add-to-bag button → IN_STOCK
-          2. Disabled add-to-cart button             → OUT_OF_STOCK
-          3. OOS text patterns                       → OUT_OF_STOCK
-          4. In-stock text patterns                  → IN_STOCK
-          5. Default                                 → UNKNOWN
-        """
+        """Determine tile availability."""
         tile_text = element.get_text(separator=" ").lower()
 
         # Enabled add-to-cart → in stock
         atc_enabled = element.find(
             lambda tag: (
                 tag.name in ("button", "a")
-                and any(
-                    p in (tag.get_text(strip=True) or "").lower()
-                    for p in _IN_STOCK_TEXT
-                )
+                and any(p in (tag.get_text(strip=True) or "").lower() for p in _IN_STOCK_TEXT)
                 and not tag.has_attr("disabled")
                 and "disabled" not in (tag.get("class") or [])
             )
@@ -329,14 +255,8 @@ class CategoryMonitor:
         atc_disabled = element.find(
             lambda tag: (
                 tag.name in ("button", "a")
-                and any(
-                    p in (tag.get_text(strip=True) or "").lower()
-                    for p in _IN_STOCK_TEXT
-                )
-                and (
-                    tag.has_attr("disabled")
-                    or "disabled" in (tag.get("class") or [])
-                )
+                and any(p in (tag.get_text(strip=True) or "").lower() for p in _IN_STOCK_TEXT)
+                and (tag.has_attr("disabled") or "disabled" in (tag.get("class") or []))
             )
         )
         if atc_disabled:
